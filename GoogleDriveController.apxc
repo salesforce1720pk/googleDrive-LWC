@@ -1,0 +1,11 @@
+public with sharing class GoogleDriveController {
+    @AuraEnabled(cacheable=true)
+    public static List<Google_Drive_File__c> getDriveFiles(Id recordId) {
+        return [
+            SELECT Id, File_Name__c, Google_Drive_Link__c, Uploaded_On__c
+            FROM Google_Drive_File__c
+            WHERE Parent_Record__c = :recordId
+            ORDER BY Uploaded_On__c DESC
+        ];
+    }
+}
