@@ -1,0 +1,28 @@
+trigger ContentVersionTrigger on ContentVersion (after insert) {
+    // Get ContentDocumentIds from new ContentVersions
+    Set<Id> contentDocIds = new Set<Id>();
+    for (ContentVersion cv : Trigger.new) {
+        contentDocIds.add(cv.ContentDocumentId);
+    }
+
+    // Map ContentVersion.Id → LinkedEntityId (record)
+    Map<Id, Id> versionToRecord = new Map<Id, Id>();
+    List<ContentDocumentLink> links = [
+        SELECT ContentDocumentId, LinkedEntityId
+        FROM ContentDocumentLink
+        WHERE ContentDocumentId IN :contentDocIds
+    ];
+
+    for (ContentVersion cv : Trigger.new) {
+        for (ContentDocumentLink link : links) {
+            if (cv.ContentDocumentId == link.ContentDocumentId && !String.valueOf(link.LinkedEntityId).startsWith('005')) {
+                versionToRecord.put(cv.Id, link.LinkedEntityId); // Skip user uploads
+            }
+        }
+    }
+
+    // Call handler asynchronously
+    for (Id cvId : versionToRecord.keySet()) {
+        ContentVersionTriggerHandler.callGDrive(String.valueOf(cvId), String.valueOf(versionToRecord.get(cvId)));
+    }
+}
