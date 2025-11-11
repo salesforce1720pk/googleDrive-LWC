@@ -1,0 +1,14 @@
+<template>
+    <lightning-card title="Google Drive Files" icon-name="utility:link">
+        <template if:true={files.data}>
+            <lightning-datatable
+                key-field="Id"
+                data={files.data}
+                columns={columns}>
+            </lightning-datatable>
+        </template>
+        <template if:true={files.error}>
+            <p class="slds-text-color_error">{files.error}</p>
+        </template>
+    </lightning-card>
+</template>
