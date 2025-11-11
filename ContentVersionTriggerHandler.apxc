@@ -1,0 +1,166 @@
+public class ContentVersionTriggerHandler {
+
+    @future(callout=true)
+    public static void callGDrive(String cvID, String recordId) {
+        try {
+            // 1) Fetch ContentVersion info
+            ContentVersion cv = [
+                SELECT Id, Title, ContentDocumentId, VersionData, PathOnClient
+                FROM ContentVersion
+                WHERE Id = :cvID
+                LIMIT 1
+            ];
+
+            Blob fileBlob = cv.VersionData;
+            String fileName = (cv.PathOnClient != null && cv.PathOnClient.trim().length() > 0)
+                              ? cv.PathOnClient
+                              : (cv.Title != null ? cv.Title : cv.Id + '');
+
+            // 2) Extract file extension
+            String fileExtension = '';
+            if (fileName != null && fileName.contains('.')) {
+                Integer idx = fileName.lastIndexOf('.');
+                if (idx > -1 && idx < fileName.length() - 1) {
+                    fileExtension = fileName.substring(idx + 1).toLowerCase();
+                }
+            }
+
+            // 3) Determine MIME type
+            String contentType;
+            switch on fileExtension {
+                when 'jpg','jpeg' { contentType = 'image/jpeg'; }
+                when 'png' { contentType = 'image/png'; }
+                when 'pdf' { contentType = 'application/pdf'; }
+                when 'doc' { contentType = 'application/msword'; }
+                when 'docx' { contentType = 'application/vnd.openxmlformats-officedocument.wordprocessingml.document'; }
+                when 'xls' { contentType = 'application/vnd.ms-excel'; }
+                when 'xlsx' { contentType = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'; }
+                when 'ppt' { contentType = 'application/vnd.ms-powerpoint'; }
+                when 'pptx' { contentType = 'application/vnd.openxmlformats-officedocument.presentationml.presentation'; }
+                when else { contentType = 'application/octet-stream'; }
+            }
+
+            Http http = new Http();
+
+            // 4) Get SObject type name (e.g., 'Account', 'Contact')
+            Id recId = Id.valueOf(recordId);
+            String sObjTypeName = recId.getSObjectType().getDescribe().getName();
+
+            // 5) Find or create Object-level folder (e.g., "Account")
+            String objectFolderId = getOrCreateFolder(http, sObjTypeName, null);
+
+            // 6) Find or create Record-level folder (inside Object folder)
+            String recordFolderId = getOrCreateFolder(http, recordId, objectFolderId);
+
+            // 7) Upload file into the record folder
+            String metadataJson = '{"name": "' + escapeJson(fileName) + '", "parents": ["' + recordFolderId + '"]}';
+            String boundary = '-------314159265358979323846';
+            String delimiter = '\r\n--' + boundary + '\r\n';
+            String closeDelimiter = '\r\n--' + boundary + '--';
+
+            String body = delimiter +
+                          'Content-Type: application/json; charset=UTF-8\r\n\r\n' +
+                          metadataJson +
+                          delimiter +
+                          'Content-Type: ' + contentType + '\r\n' +
+                          'Content-Transfer-Encoding: base64\r\n\r\n' +
+                          EncodingUtil.base64Encode(fileBlob) +
+                          closeDelimiter;
+
+            HttpRequest uploadReq = new HttpRequest();
+            uploadReq.setEndpoint('callout:google_drive_namedCred_upload/files?uploadType=multipart');
+            uploadReq.setMethod('POST');
+            uploadReq.setHeader('Content-Type', 'multipart/related; boundary="' + boundary + '"');
+            uploadReq.setBody(body);
+            uploadReq.setTimeout(120000);
+
+            HttpResponse uploadResp = http.send(uploadReq);
+
+            if (uploadResp.getStatusCode() == 200 || uploadResp.getStatusCode() == 201) {
+                System.debug('✅ File "' + fileName + '" uploaded successfully to folder ' + recordFolderId);
+
+                // Parse the JSON response to get file ID and name
+                Map<String, Object> uploadResult = (Map<String, Object>) JSON.deserializeUntyped(uploadResp.getBody());
+                String driveFileId = (String) uploadResult.get('id');
+                String driveFileName = (String) uploadResult.get('name');
+                String driveFileLink = 'https://drive.google.com/file/d/' + driveFileId + '/view';
+
+                // 8) Create a record in Google_Drive_File__c
+                Google_Drive_File__c gFile = new Google_Drive_File__c();
+                gFile.Name = driveFileName;
+                gFile.File_Name__c = fileName;
+                gFile.Google_Drive_File_ID__c = driveFileId;
+                gFile.Google_Drive_Link__c = driveFileLink;
+                gFile.Parent_Record__c = recId;
+                gFile.Uploaded_On__c = System.now();
+
+                insert gFile;
+
+            } else {
+                System.debug('❌ Upload failed: ' + uploadResp.getStatus() + ' ' + uploadResp.getBody());
+            }
+
+        } catch (Exception e) {
+            System.debug('⚠️ Error in callGDrive: ' + e.getMessage());
+        }
+    }
+
+    // Helper: Get or create folder (optionally with a parent folder)
+    private static String getOrCreateFolder(Http http, String folderName, String parentId) {
+        try {
+            String query = 'name = \'' + folderName + '\' and mimeType = \'application/vnd.google-apps.folder\'';
+            if (parentId != null) {
+                query += ' and \'' + parentId + '\' in parents';
+            }
+
+            String encodedQuery = EncodingUtil.urlEncode(query, 'UTF-8');
+            HttpRequest checkReq = new HttpRequest();
+            checkReq.setEndpoint('callout:google_drive_named_cred/files?q=' + encodedQuery + '&fields=files(id,name)');
+            checkReq.setMethod('GET');
+            checkReq.setHeader('Accept', 'application/json');
+
+            HttpResponse checkResp = http.send(checkReq);
+
+            if (checkResp.getStatusCode() == 200) {
+                Map<String, Object> jsonResp = (Map<String, Object>) JSON.deserializeUntyped(checkResp.getBody());
+                List<Object> files = (List<Object>) jsonResp.get('files');
+                if (files != null && !files.isEmpty()) {
+                    Map<String, Object> folder = (Map<String, Object>) files[0];
+                    return (String) folder.get('id');
+                }
+            }
+
+            // Create folder if not found
+            String parentField = parentId != null ? ',"parents": ["' + parentId + '"]' : '';
+            String body = '{"name": "' + escapeJson(folderName) + '", "mimeType": "application/vnd.google-apps.folder"' + parentField + '}';
+
+            HttpRequest createReq = new HttpRequest();
+            createReq.setEndpoint('callout:google_drive_named_cred/files');
+            createReq.setMethod('POST');
+            createReq.setHeader('Content-Type', 'application/json');
+            createReq.setBody(body);
+
+            HttpResponse createResp = http.send(createReq);
+
+            if (createResp.getStatusCode() == 200 || createResp.getStatusCode() == 201) {
+                Map<String, Object> newFolder = (Map<String, Object>) JSON.deserializeUntyped(createResp.getBody());
+                return (String) newFolder.get('id');
+            } else {
+                System.debug('⚠️ Folder creation failed: ' + createResp.getBody());
+            }
+
+        } catch (Exception e) {
+            System.debug('⚠️ Error in getOrCreateFolder: ' + e.getMessage());
+        }
+        return null;
+    }
+
+    // Helper: Escape JSON strings safely
+    private static String escapeJson(String s) {
+        if (s == null) return '';
+        return s.replace('\\', '\\\\')
+                .replace('"', '\\"')
+                .replace('\n', '\\n')
+                .replace('\r', '\\r');
+    }
+}
